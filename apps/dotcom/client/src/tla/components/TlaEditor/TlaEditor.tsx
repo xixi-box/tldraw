@@ -71,7 +71,6 @@ import { SneakyToolSwitcher } from './sneaky/SneakyToolSwitcher'
 import { A11yAudit } from './TlaDebug'
 import { TlaEditorWrapper } from './TlaEditorWrapper'
 import { useFileLoad, useFileSyncStore } from './TlaFileSyncHost'
-import { useExtraDragIconOverrides } from './useExtraToolDragIcons'
 import { useFileEditorOverrides } from './useFileEditorOverrides'
 
 const messages = defineMessages({
@@ -336,7 +335,6 @@ function TlaEditorInner({ fileSlug, deepLinks, isEmbed = false }: TlaEditorProps
 	}, [app, fileId, store.status])
 
 	const overrides = useFileEditorOverrides({ fileSlug })
-	const extraDragIconOverrides = useExtraDragIconOverrides()
 	const anonCommentToolOverrides = useAnonCommentToolOverrides()
 	const commentingEnabled = useIsCommentingEnabled()
 
@@ -363,8 +361,8 @@ function TlaEditorInner({ fileSlug, deepLinks, isEmbed = false }: TlaEditorProps
 	// turns their button into the sign-in dialog. On read-only canvases the button and `c` shortcut
 	// hide via the UI's readonly handling, and composing is gated by the tool's `canComment`.
 	const editorOverrides = useMemo(
-		() => [overrides, extraDragIconOverrides, commentToolOverrides, anonCommentToolOverrides],
-		[overrides, extraDragIconOverrides, anonCommentToolOverrides]
+		() => [overrides, commentToolOverrides, anonCommentToolOverrides],
+		[overrides, anonCommentToolOverrides]
 	)
 
 	return (

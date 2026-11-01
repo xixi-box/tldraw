@@ -1,7 +1,6 @@
 import { ReactNode, useMemo } from 'react'
 import { Editor, TLComponents, Tldraw, TldrawOptions, TLUiOverrides, useEvent } from 'tldraw'
 import { SneakyToolSwitcher } from '../tla/components/TlaEditor/sneaky/SneakyToolSwitcher'
-import { useExtraDragIconOverrides } from '../tla/components/TlaEditor/useExtraToolDragIcons'
 import { useFileEditorOverrides } from '../tla/components/TlaEditor/useFileEditorOverrides'
 import { useHandleUiEvents } from '../utils/analytics'
 import { assetUrls } from '../utils/assetUrls'
@@ -26,15 +25,14 @@ export function LocalEditor({
 	persistenceKey?: string
 	'data-testid'?: string
 	options?: Partial<TldrawOptions>
-	/** Composed after the file-system and drag-icon overrides every local editor gets. */
+	/** Composed after the file-system overrides every local editor gets. */
 	overrides?: TLUiOverrides[]
 }) {
 	const handleUiEvent = useHandleUiEvents()
 	const fileSystemUiOverrides = useFileEditorOverrides({})
-	const extraDragIconOverrides = useExtraDragIconOverrides()
 	const editorOverrides = useMemo(
-		() => [fileSystemUiOverrides, extraDragIconOverrides, ...(overrides ?? [])],
-		[fileSystemUiOverrides, extraDragIconOverrides, overrides]
+		() => [fileSystemUiOverrides, ...(overrides ?? [])],
+		[fileSystemUiOverrides, overrides]
 	)
 
 	const handleMount = useEvent((editor: Editor) => {
