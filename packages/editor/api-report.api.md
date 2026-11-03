@@ -3438,6 +3438,12 @@ export class TextManager extends EditorManager {
         box: BoxModel;
         text: string;
     }[];
+    measureWordsInkOverflow(words: string[], opts: TLMeasureTextOpts): {
+        bottom: number;
+        left: number;
+        right: number;
+        top: number;
+    };
 }
 
 // @public

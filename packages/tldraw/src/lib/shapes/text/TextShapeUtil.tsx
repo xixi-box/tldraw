@@ -6,6 +6,7 @@ import {
 	ShapeUtil,
 	SvgExportContext,
 	TLGeometryOpts,
+	TLMeasureTextOpts,
 	TLResizeInfo,
 	TLShapeId,
 	TLTextShape,
@@ -31,24 +32,73 @@ import { getThemeFontFaces } from '../shared/defaultFonts'
 import { ShapeOptionsWithDisplayValues, getDisplayValues } from '../shared/getDisplayValues'
 import { RichTextLabel, RichTextSVG } from '../shared/RichTextLabel'
 
-// Export-only slack (as a fraction of font size) added around a text shape's advance box in `toSvg`,
-// so italic/cursive glyph ink that spills past the box — side bearings, slanted ascenders — isn't
-// clipped at the <foreignObject> edge on export (#8802). The text still renders in the same place;
-// the export's auto-trim crops the extra room back to the real pixels, so the PNG stays tight. This
-// is deliberately export-only: the shape's geometry (selection, hit-testing, the text-edit cursor)
-// stays the advance box, which is the right box for those.
+// Minimum slack (as a fraction of font size) around a text shape's advance box in `toSvg`, on top of
+// the measured ink overflow, so glyph ink that spills past the box isn't clipped at the
+// <foreignObject> edge on export (#8802). The export's auto-trim crops the extra room back to the
+// real pixels, so the PNG stays tight.
 const TEXT_EXPORT_INK_MARGIN = 0.3
 
-const sizeCache = createComputedCache(
-	'text size',
-	(editor: Editor, shape: TLTextShape) => {
+const ZERO_OVERFLOW = { left: 0, right: 0, top: 0, bottom: 0 }
+
+interface TextInkOverflow {
+	left: number
+	right: number
+	top: number
+	bottom: number
+}
+
+interface TextShapeBounds {
+	width: number
+	height: number
+	overflow: TextInkOverflow
+}
+
+// The advance box changes with the wrap width, but a word's ink bleed does not. Measure the advance
+// with the DOM, then get the ink overflow from per-word (cached) measurements, so resizing only pays
+// for the one reflow. Latin text sits inside its advance box, so its overflow is zero.
+const textBoundsCache = createComputedCache(
+	'text bounds',
+	(editor: Editor, shape: TLTextShape): TextShapeBounds => {
 		editor.fonts.trackFontsForShape(shape)
 		const util = editor.getShapeUtil(shape) as TextShapeUtil
 		const dv = getDisplayValues(util, shape)
-		return getTextSize(editor, shape.props, dv)
+		const { html, opts, maybeFixedWidth, minWidth } = getTextMeasureSpec(editor, shape.props, dv)
+		const advance = editor.textMeasure.measureHtml(html, opts)
+		const { width, height } = resolveTextSize(advance, maybeFixedWidth, minWidth, dv.fontSize)
+		// Italic/bold widen a word's bleed and the marks live on runs, not on `opts`; measure
+		// conservatively in that style when any run uses it.
+		const { words, italic, bold } = getRichTextInkInputs(editor, shape.props.richText)
+		const overflow = editor.textMeasure.measureWordsInkOverflow(words, {
+			...opts,
+			fontStyle: italic ? 'italic' : opts.fontStyle,
+			fontWeight: bold ? 'bold' : opts.fontWeight,
+		})
+		return { width, height, overflow }
 	},
 	{ areRecordsEqual: (a, b) => a.props === b.props }
 )
+
+function richTextHasMark(node: any, type: string): boolean {
+	if (node?.marks?.some((m: any) => m.type === type)) return true
+	return Array.isArray(node?.content) && node.content.some((c: any) => richTextHasMark(c, type))
+}
+
+const richTextInkInputsCache = new WeakMap<
+	object,
+	{ words: string[]; italic: boolean; bold: boolean }
+>()
+function getRichTextInkInputs(editor: Editor, richText: TLTextShape['props']['richText']) {
+	let inputs = richTextInkInputsCache.get(richText)
+	if (!inputs) {
+		inputs = {
+			words: renderPlaintextFromRichText(editor, richText).split(/\s+/).filter(Boolean),
+			italic: richTextHasMark(richText, 'italic'),
+			bold: richTextHasMark(richText, 'bold'),
+		}
+		richTextInkInputsCache.set(richText, inputs)
+	}
+	return inputs
+}
 /** @public */
 export interface TextShapeUtilDisplayValues {
 	color: string
@@ -111,25 +161,25 @@ export class TextShapeUtil extends ShapeUtil<TLTextShape> {
 	}
 
 	getMinDimensions(shape: TLTextShape) {
-		return sizeCache.get(this.editor, shape.id)!
+		const { width, height } = textBoundsCache.get(this.editor, shape.id)!
+		return { width, height }
 	}
 
 	getGeometry(shape: TLTextShape, opts: TLGeometryOpts) {
 		const { scale } = shape.props
-		const { width, height } = this.getMinDimensions(shape)!
+		const { width, height, overflow } = textBoundsCache.get(this.editor, shape.id)!
 		const context = opts?.context ?? 'none'
+		const isArrowLabel = context === '@tldraw/arrow-without-arrowhead'
+		const arrowPadding = isArrowLabel ? this.options.extraArrowHorizontalPadding : 0
+		// Grow the geometry by the ink overflow so the indicator, selection bounds, hit-testing,
+		// snapping, and export viewport all enclose the rendered text. The text itself still renders
+		// at the unpadded width, so its position is unchanged. Arrow labels stay on the advance box.
+		const ink = isArrowLabel ? ZERO_OVERFLOW : overflow
 		return new Rectangle2d({
-			x:
-				(context === '@tldraw/arrow-without-arrowhead'
-					? -this.options.extraArrowHorizontalPadding
-					: 0) * scale,
-			width:
-				(width +
-					(context === '@tldraw/arrow-without-arrowhead'
-						? this.options.extraArrowHorizontalPadding * 2
-						: 0)) *
-				scale,
-			height: height * scale,
+			x: (-arrowPadding - ink.left) * scale,
+			y: -ink.top * scale,
+			width: (width + arrowPadding * 2 + ink.left + ink.right) * scale,
+			height: (height + ink.top + ink.bottom) * scale,
 			isFilled: true,
 			isLabel: true,
 		})
@@ -199,21 +249,21 @@ export class TextShapeUtil extends ShapeUtil<TLTextShape> {
 		if (shape.props.autoSize && this.editor.getEditingShapeId() === shape.id) return undefined
 		const bounds = this.editor.getShapeGeometry(shape).bounds
 		const path = new Path2D()
-		path.rect(0, 0, bounds.width, bounds.height)
+		path.rect(bounds.x, bounds.y, bounds.width, bounds.height)
 		return path
 	}
 
 	override toSvg(shape: TLTextShape, ctx: SvgExportContext) {
-		const bounds = this.editor.getShapeGeometry(shape).bounds
-		const width = bounds.width / (shape.props.scale ?? 1)
-		const height = bounds.height / (shape.props.scale ?? 1)
-
+		const { width, height, overflow } = textBoundsCache.get(this.editor, shape.id)!
 		const dv = getDisplayValues(this, shape, ctx.colorMode)
 
-		// Pad the exported foreignObject by a margin so glyph ink can spill past the advance box
-		// without being clipped at its edge; the text is inset by the same margin so it renders in the
-		// same place, and the export's trim crops the slack back to content. See TEXT_EXPORT_INK_MARGIN.
-		const inkMargin = Math.ceil(dv.fontSize * TEXT_EXPORT_INK_MARGIN)
+		// A foreignObject clips its content to its own bounds when rasterised, so pad it by the
+		// measured ink overflow (and the older font-size margin, as a minimum) and inset the text by
+		// the same amount. The export's trim crops the slack back to the real pixels.
+		const inkMargin = Math.max(
+			Math.ceil(dv.fontSize * TEXT_EXPORT_INK_MARGIN),
+			Math.ceil(Math.max(overflow.left, overflow.right, overflow.top, overflow.bottom))
+		)
 		const exportBounds = new Box(
 			-inkMargin,
 			-inkMargin,
@@ -361,31 +411,45 @@ export class TextShapeUtil extends ShapeUtil<TLTextShape> {
 	// }
 }
 
-function getTextSize(editor: Editor, props: TLTextShape['props'], dv: TextShapeUtilDisplayValues) {
-	const { richText, w } = props
-
+function getTextMeasureSpec(
+	editor: Editor,
+	props: TLTextShape['props'],
+	dv: TextShapeUtilDisplayValues
+) {
 	const minWidth = 16
-
-	const maybeFixedWidth = props.autoSize ? null : Math.max(minWidth, Math.floor(w))
-
-	const html = renderHtmlFromRichTextForMeasurement(editor, richText)
-	const result = editor.textMeasure.measureHtml(html, {
-		lineHeight: dv.lineHeight,
-		fontWeight: dv.fontWeight,
+	const maybeFixedWidth = props.autoSize ? null : Math.max(minWidth, Math.floor(props.w))
+	const html = renderHtmlFromRichTextForMeasurement(editor, props.richText)
+	const opts: TLMeasureTextOpts = {
 		fontStyle: dv.fontStyle,
-		padding: '0px',
+		fontWeight: dv.fontWeight,
 		fontFamily: dv.fontFamily,
 		fontSize: dv.fontSize,
+		lineHeight: dv.lineHeight,
 		maxWidth: maybeFixedWidth,
-	})
+		padding: '0px',
+	}
+	return { html, opts, maybeFixedWidth, minWidth }
+}
 
+function resolveTextSize(
+	advance: { w: number; h: number },
+	maybeFixedWidth: number | null,
+	minWidth: number,
+	fontSize: number
+) {
 	// If we're autosizing the measureText will essentially `Math.floor`
 	// the numbers so `19` rather than `19.3`, this means we must +1 to
 	// whatever we get to avoid wrapping.
 	return {
-		width: maybeFixedWidth ?? Math.max(minWidth, result.w + 1),
-		height: Math.max(dv.fontSize, result.h),
+		width: maybeFixedWidth ?? Math.max(minWidth, advance.w + 1),
+		height: Math.max(fontSize, advance.h),
 	}
+}
+
+function getTextSize(editor: Editor, props: TLTextShape['props'], dv: TextShapeUtilDisplayValues) {
+	const { html, opts, maybeFixedWidth, minWidth } = getTextMeasureSpec(editor, props, dv)
+	const result = editor.textMeasure.measureHtml(html, opts)
+	return resolveTextSize(result, maybeFixedWidth, minWidth, dv.fontSize)
 }
 
 function useTextShapeKeydownHandler(id: TLShapeId) {

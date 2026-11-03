@@ -94,6 +94,30 @@ export interface TLMeasureTextSpanOpts {
 
 const spaceCharacterRegex = /\s/
 
+// Strong-RTL scripts, so each word's ink is measured in the direction the browser lays it out.
+const rtlCharacterRegex =
+	/[\u0590-\u05FF\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF\uFB1D-\uFDFF\uFE70-\uFEFF]/
+
+interface TextInkBleed {
+	left: number
+	right: number
+	top: number
+	bottom: number
+	maxLeft: number
+	maxRight: number
+	advance: number
+}
+
+const ZERO_INK_BLEED: TextInkBleed = {
+	left: 0,
+	right: 0,
+	top: 0,
+	bottom: 0,
+	maxLeft: 0,
+	maxRight: 0,
+	advance: 0,
+}
+
 const initialDefaultStyles = Object.freeze({
 	'overflow-wrap': 'break-word',
 	'word-break': 'auto',
@@ -107,6 +131,9 @@ const initialDefaultStyles = Object.freeze({
 export class TextManager extends EditorManager {
 	private elm: HTMLDivElement
 	private poolElms: PoolItem[] = []
+	private inkCtx: CanvasRenderingContext2D | null | undefined
+	// Per-word ink bleed, nested font -> word -> bleed so the per-word lookup needs no string key.
+	private wordBleedCache = new Map<string, Map<string, TextInkBleed>>()
 
 	constructor(editor: Editor) {
 		super(editor)
@@ -471,6 +498,109 @@ export class TextManager extends EditorManager {
 			return spans
 		} finally {
 			restoreStyles()
+		}
+	}
+
+	private getInkContext(): CanvasRenderingContext2D | null {
+		if (this.inkCtx !== undefined) return this.inkCtx
+		const canvas = this.editor.getContainerDocument().createElement('canvas')
+		this.inkCtx = canvas.getContext('2d')
+		return this.inkCtx
+	}
+
+	private measureWordInkBleed(
+		word: string,
+		font: string,
+		opts: TLMeasureTextOpts
+	): TextInkBleed {
+		const ctx = this.getInkContext()
+		if (!ctx) return ZERO_INK_BLEED
+		ctx.font = font
+		ctx.textAlign = 'left'
+		ctx.textBaseline = 'alphabetic'
+		ctx.direction = rtlCharacterRegex.test(word) ? 'rtl' : 'ltr'
+		const m = ctx.measureText(word)
+		const lineBoxH = resolveLineHeightPx(opts.fontSize, opts.lineHeight)
+		const fontAscent = m.fontBoundingBoxAscent || opts.fontSize
+		const fontDescent = m.fontBoundingBoxDescent || 0
+		// Where CSS line-height puts the baseline inside the line box (half-leading above the ascent).
+		const baseline = (lineBoxH - (fontAscent + fontDescent)) / 2 + fontAscent
+		const left = Math.max(0, m.actualBoundingBoxLeft)
+		const right = Math.max(0, m.actualBoundingBoxRight - m.width)
+		// A word wider than the box can wrap mid-word (overflow-wrap: break-word), so any prefix could
+		// end a line and any suffix could start one. Measure each as a real run so shaping stays correct.
+		let maxLeft = left
+		let maxRight = right
+		const graphemes = Array.from(iterateGraphemes(word))
+		let prefix = ''
+		let suffix = ''
+		for (let i = 0; i < graphemes.length - 1; i++) {
+			prefix += graphemes[i]
+			const pm = ctx.measureText(prefix)
+			if (pm.actualBoundingBoxRight - pm.width > maxRight) {
+				maxRight = pm.actualBoundingBoxRight - pm.width
+			}
+			suffix = graphemes[graphemes.length - 1 - i] + suffix
+			const sm = ctx.measureText(suffix)
+			if (sm.actualBoundingBoxLeft > maxLeft) maxLeft = sm.actualBoundingBoxLeft
+		}
+		return {
+			left,
+			right,
+			top: Math.max(0, m.actualBoundingBoxAscent - baseline),
+			bottom: Math.max(0, baseline + m.actualBoundingBoxDescent - lineBoxH),
+			maxLeft: Math.max(0, maxLeft),
+			maxRight: Math.max(0, maxRight),
+			advance: m.width,
+		}
+	}
+
+	/**
+	 * Measure how far glyph ink spills past the advance box of wrapped text on each side.
+	 *
+	 * A line normally breaks at a word boundary, so its edges are word edges; a word wider than the
+	 * box can also break mid-word, so for those we use its worst prefix/suffix overhang. The result
+	 * is whole-pixel padded so callers can grow a shape's bounds to contain the rendered text.
+	 *
+	 * @public
+	 */
+	measureWordsInkOverflow(
+		words: string[],
+		opts: TLMeasureTextOpts
+	): { left: number; right: number; top: number; bottom: number } {
+		const font = `${opts.fontStyle} ${opts.fontWeight} ${opts.fontSize}px ${opts.fontFamily}`
+		// Vertical bleed depends on the resolved line box, not just the font shorthand.
+		const cacheKey = `${font}|${opts.lineHeight}`
+		let byWord = this.wordBleedCache.get(cacheKey)
+		if (!byWord) {
+			byWord = new Map()
+			this.wordBleedCache.set(cacheKey, byWord)
+		}
+		const wrapWidth = opts.maxWidth
+		let left = 0
+		let right = 0
+		let top = 0
+		let bottom = 0
+		for (const word of words) {
+			if (!word) continue
+			let b = byWord.get(word)
+			if (b === undefined) {
+				b = this.measureWordInkBleed(word, font, opts)
+				byWord.set(word, b)
+			}
+			const breaksMidWord = wrapWidth !== null && b.advance > wrapWidth
+			const wordLeft = breaksMidWord ? b.maxLeft : b.left
+			const wordRight = breaksMidWord ? b.maxRight : b.right
+			if (wordLeft > left) left = wordLeft
+			if (wordRight > right) right = wordRight
+			if (b.top > top) top = b.top
+			if (b.bottom > bottom) bottom = b.bottom
+		}
+		return {
+			left: Math.ceil(left),
+			right: Math.ceil(right),
+			top: Math.ceil(top),
+			bottom: Math.ceil(bottom),
 		}
 	}
 }
